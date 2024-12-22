@@ -1,37 +1,109 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
-
-type Coordinator struct {
-	// Your definitions here.
-
+type Task struct {
+	Type      TaskType
+	ID        int
+	FileName  string
+	Status    TaskStatus
+	StartTime time.Time
 }
 
-// Your code here -- RPC handlers for the worker to call.
+type Coordinator struct {
+	mu          sync.Mutex
+	mapTasks    []Task
+	reduceTasks []Task
+	nReduce     int
+	nMap        int
+	mapsDone    bool
+	reducesDone bool
+}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (c *Coordinator) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !c.mapsDone {
+		for i, task := range c.mapTasks {
+			if task.Status == Idle || (task.Status == InProgress && time.Since(task.StartTime) > 10*time.Second) {
+				c.mapTasks[i].Status = InProgress
+				c.mapTasks[i].StartTime = time.Now()
+				*reply = GetTaskReply{TaskType: MapTask, TaskID: task.ID, FileName: task.FileName, NReduce: c.nReduce, NMap: c.nMap}
+				return nil
+			}
+		}
+		if c.allMapTasksCompleted() {
+			c.mapsDone = true
+		} else {
+			*reply = GetTaskReply{TaskType: WaitTask}
+			return nil
+		}
+	}
+
+	if !c.reducesDone {
+		for i, task := range c.reduceTasks {
+			if task.Status == Idle || (task.Status == InProgress && time.Since(task.StartTime) > 10*time.Second) {
+				c.reduceTasks[i].Status = InProgress
+				c.reduceTasks[i].StartTime = time.Now()
+				*reply = GetTaskReply{TaskType: ReduceTask, TaskID: task.ID, NReduce: c.nReduce, NMap: c.nMap}
+				return nil
+			}
+		}
+		if c.allReduceTasksCompleted() {
+			c.reducesDone = true
+		} else {
+			*reply = GetTaskReply{TaskType: WaitTask}
+			return nil
+		}
+	}
+
+	*reply = GetTaskReply{TaskType: ExitTask}
 	return nil
 }
 
+func (c *Coordinator) TaskCompleted(args *TaskCompletionArgs, reply *TaskCompletionReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-//
-// start a thread that listens for RPCs from worker.go
-//
+	if args.TaskType == MapTask {
+		c.mapTasks[args.TaskID].Status = Completed
+	} else if args.TaskType == ReduceTask {
+		c.reduceTasks[args.TaskID].Status = Completed
+	}
+
+	return nil
+}
+
+func (c *Coordinator) allMapTasksCompleted() bool {
+	for _, task := range c.mapTasks {
+		if task.Status != Completed {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) allReduceTasksCompleted() bool {
+	for _, task := range c.reduceTasks {
+		if task.Status != Completed {
+			return false
+		}
+	}
+	return true
+}
+
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -41,29 +113,27 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-//
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
-//
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reducesDone
 }
 
-//
-// create a Coordinator.
-// main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
-//
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	c := Coordinator{
+		nReduce:     nReduce,
+		nMap:        len(files),
+		mapTasks:    make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
+	}
 
-	// Your code here.
+	for i, file := range files {
+		c.mapTasks[i] = Task{Type: MapTask, ID: i, FileName: file, Status: Idle}
+	}
 
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[i] = Task{Type: ReduceTask, ID: i, Status: Idle}
+	}
 
 	c.server()
 	return &c
